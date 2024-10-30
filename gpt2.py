@@ -535,9 +535,8 @@ class MyGPT2LMHeadModel(torch.nn.Module):
 
                 if finished.all():
                     break
-            
+
             return all_sequences
-        
 
 
 if __name__ == "__main__":
