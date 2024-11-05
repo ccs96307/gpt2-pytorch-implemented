@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import warnings
 warnings.simplefilter(action="ignore", category=FutureWarning)
 warnings.simplefilter(action="ignore", category=UserWarning)
@@ -6,33 +8,32 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-# Settings
-pretrained_model_name_or_path = "openai-community/gpt2"
-
-# Model & Tokenizer
-model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path).cuda().eval()
-tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
-
-
 def apply_repetition_penalty(
     logits: torch.FloatTensor,
     prefix_token_ids: torch.LongTensor,
     repetition_penalty: float = 1.0,
 ) -> torch.FloatTensor:
-    for batch_idx in range(prefix_token_ids.shape[0]):
-        for token_id in set(prefix_token_ids[batch_idx].tolist()):
-            if logits[batch_idx, token_id] < 0:
-                logits[batch_idx, token_id] *= repetition_penalty
-            else:
-                logits[batch_idx, token_id] /= repetition_penalty
+    batch_size, gamma, vocab_size = logits.shape
+    seq_length = prefix_token_ids.shape[1]
+
+    for batch_idx in range(batch_size):
+        for gamma_idx in range(gamma):
+            current_prefix = prefix_token_ids[batch_idx, :seq_length - gamma + gamma_idx + 1]
+
+            unique_token_ids = set(current_prefix.tolist())
+
+            for token_id in unique_token_ids:
+                if logits[batch_idx, gamma_idx, token_id] > 0:
+                    logits[batch_idx, gamma_idx, token_id] /= repetition_penalty
+                else:
+                    logits[batch_idx, gamma_idx, token_id] *= repetition_penalty
+
     return logits
 
 def top_k_filtering(logits: torch.FloatTensor, top_k: int) -> torch.FloatTensor:
     if top_k > 0:
-        values, indices = torch.topk(logits, top_k, dim=-1)
-        min_values = values[:, -1].unsqueeze(dim=-1)
+        values, _ = torch.topk(logits, top_k, dim=-1)
+        min_values = values[:, :, -1].unsqueeze(dim=-1)
         logits = torch.where(logits < min_values, torch.full_like(logits, -float("Inf")), logits)
 
     return logits
@@ -46,11 +47,11 @@ def top_p_filtering(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     sorted_indices_to_remove = cumulative_probs > top_p
     
     # Get at least one element
-    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-    sorted_indices_to_remove[:, 0] = False
+    sorted_indices_to_remove[:, :, 1:] = sorted_indices_to_remove[:, :, :-1].clone()
+    sorted_indices_to_remove[:, :, 0] = False
     
     # Create the mask that have the same shape of logits
-    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+    indices_to_remove = sorted_indices_to_remove.scatter(2, sorted_indices, sorted_indices_to_remove)
     logits = logits.masked_fill(indices_to_remove, -float("Inf"))
     
     return logits
@@ -64,8 +65,9 @@ def sample_next_token(
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
     eps: float = 1e-7,
-) -> torch.FloatTensor:
-    curr_logits = logits[:, -1, :]
+    probs_num: int = 1,
+) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+    curr_logits = logits[:, -probs_num:, :]
 
     # Apply repetition penalty
     if repetition_penalty != 1.0:
@@ -88,81 +90,86 @@ def sample_next_token(
     probs = torch.softmax(curr_logits, dim=-1)
 
     # Sampling
-    next_token = torch.multinomial(probs, num_samples=1)
+    next_token = torch.multinomial(probs[:, -1, :], num_samples=1)
 
-    return next_token
-
-
-temperature = 0.1
-top_k = 50
-top_p = 0.9
-repetition_penalty = 1.2
+    return next_token, probs
 
 
-# Test data
-sentences = [
-    "Today is a nice day",
-    "How are you?",
-]
+if __name__ == "__main__":
+    # Settings
+    pretrained_model_name_or_path = "openai-community/gpt2"
+    temperature = 0.1
+    top_k = 50
+    top_p = 0.9
+    repetition_penalty = 1.2
 
-inputs = tokenizer(
-    sentences,
-    max_length=512,
-    truncation=True,
-    padding=True,
-    return_tensors="pt",
-).to("cuda:0")
+    # Model & Tokenizer
+    model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path).cuda().eval()
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    # Test data
+    sentences = [
+        "Today is a nice day",
+        "How are you?",
+    ]
+
+    inputs = tokenizer(
+        sentences,
+        max_length=512,
+        truncation=True,
+        padding=True,
+        return_tensors="pt",
+    ).to("cuda:0")
+
+    print("=== My Sampling ===")
+    for idx in range(10):
+        outputs = model(**inputs)
+
+        next_tokens, probs = sample_next_token(
+            outputs.logits,
+            prefix_token_ids=inputs["input_ids"],
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+
+        input_ids = torch.cat([inputs["input_ids"], next_tokens], dim=-1)
+        attention_mask = torch.cat([inputs["attention_mask"], torch.ones(inputs["attention_mask"].shape[0], 1).to(inputs["input_ids"].device.type)], dim=-1)
+
+        inputs["input_ids"] = input_ids
+        inputs["attention_mask"] = attention_mask
 
 
-print("=== My Sampling ===")
-for idx in range(10):
-    outputs = model(**inputs)
+    for sent in tokenizer.batch_decode(inputs.input_ids):
+        print(sent)
 
-    next_tokens = sample_next_token(
-        outputs.logits,
-        prefix_token_ids=inputs["input_ids"],
+    print("\n=== HuggingFace ===")
+
+
+    # Test data
+    sentences = [
+        "Today is a nice day",
+        "How are you?",
+    ]
+
+    inputs = tokenizer(
+        sentences,
+        max_length=512,
+        truncation=True,
+        padding=True,
+        return_tensors="pt",
+    ).to("cuda:0")
+
+    outputs = model.generate(
+        **inputs,
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
     )
 
-    input_ids = torch.cat([inputs["input_ids"], next_tokens], dim=-1)
-    attention_mask = torch.cat([inputs["attention_mask"], torch.ones(inputs["attention_mask"].shape[0], 1).to(inputs["input_ids"].device.type)], dim=-1)
-
-    inputs["input_ids"] = input_ids
-    inputs["attention_mask"] = attention_mask
-
-
-for sent in tokenizer.batch_decode(inputs.input_ids):
-    print(sent)
-
-print("\n=== HuggingFace ===")
-
-
-# Test data
-sentences = [
-    "Today is a nice day",
-    "How are you?",
-]
-
-inputs = tokenizer(
-    sentences,
-    max_length=512,
-    truncation=True,
-    padding=True,
-    return_tensors="pt",
-).to("cuda:0")
-
-
-outputs = model.generate(
-    **inputs,
-    temperature=temperature,
-    top_k=top_k,
-    top_p=top_p,
-    repetition_penalty=repetition_penalty,
-)
-
-
-for sent in tokenizer.batch_decode(outputs):
-    print(sent)
+    for sent in tokenizer.batch_decode(outputs):
+        print(sent)
